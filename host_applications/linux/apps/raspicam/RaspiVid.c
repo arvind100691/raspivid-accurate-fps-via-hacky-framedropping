@@ -1,4 +1,5 @@
 /*
+Copyright (c) 2015 d3fault <d3fault@d3fault.net>
 Copyright (c) 2013, Broadcom Europe Ltd
 Copyright (c) 2013, James Hughes
 All rights reserved.
@@ -188,6 +189,10 @@ struct RASPIVID_STATE_S
    int settings;                        /// Request settings from the camera
    int sensor_mode;			            /// Sensor mode. 0=auto. Check docs/forum for modes selected by other values.
    int intra_refresh_type;              /// What intra refresh type to use. -1 to not set.
+
+//#define MAX_DRIFT_AMOUNT_IN_FRAMES_BEFORE_DROPPING_A_FRAME 3 ///This could be renamed and used to also determine when to repeat a frame, should that half be implemented
+   int nFrames;				/// Number of frames
+   int bDroppingFrame;			/// Whether or not the current frame is being dropped
 };
 
 
@@ -354,6 +359,9 @@ static void default_status(RASPIVID_STATE *state)
    state->sensor_mode = 0;
 
    state->intra_refresh_type = -1;
+
+   state->nFrames = 0;
+   state->bDroppingFrame = 0;
 
    // Setup preview window defaults
    raspipreview_set_defaults(&state->preview_parameters);
@@ -807,6 +815,64 @@ static void display_valid_parameters(char *app_name)
 }
 
 /**
+ *  determines whether or not the camera has been giving us frames faster than it should, given the desired fps
+ *
+ * @param pData Pointer to user data / state
+ * @param current_time Current time in milliseconds
+ */
+static int framesHaveBeenOutputtingTooFastForDesiredFps(PORT_USERDATA *pData, const int64_t current_time)
+{
+    static char beenHereBefore = 0;
+    static double start_time = 0;
+    static double msPerFrame = 0;
+    if(beenHereBefore == 0)
+    {
+	beenHereBefore = 1;
+	start_time = (double)current_time;
+	msPerFrame = ((double)(((double)1000.0) / ((double)(pData->pstate->framerate-1))));
+    }
+
+    int numFramesThereShouldBeAtThisTime = ((((double)current_time) - start_time) / msPerFrame) + 1; //the +1 is to account for the first frame, which is already made before we get here the first time
+    //~100ms (@ 30fps) drift is noticeable, but only just. the closer this gets to zero, the less the video will drift. however, getting too close to zero would cause an excessive amount of frames to be dropped. actually, setting this to zero is perfectly fine as long as we aren't additionally repeating frames in a manner similar (yet opposite) to this frame dropping
+    //if ((pData->pstate->nFrames - numFramesThereShouldBeAtThisTime) > MAX_DRIFT_AMOUNT_IN_FRAMES_BEFORE_DROPPING_A_FRAME)
+    if (pData->pstate->nFrames > numFramesThereShouldBeAtThisTime)
+	return 1;
+    return 0;
+}
+
+/**
+ *  determines whether or not to output the current buffer, depending on whether or not we are dropping a frame
+ *
+ * @param port Pointer to port from which callback originated
+ * @param buffer mmal buffer header pointer
+ * @param pData Pointer to user data / state
+ * @param current_time Current time in milliseconds
+ */
+static int wantBufferGivenDesiredFps(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer, PORT_USERDATA *pData, const int64_t current_time)
+{
+    //see if we need to drop a frame to maintain the desired fps
+    if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_FRAME_END)
+    {
+       if (pData->pstate->bDroppingFrame)
+       {
+	   pData->pstate->bDroppingFrame = 0;
+	   if (mmal_port_parameter_set_boolean(port, MMAL_PARAMETER_VIDEO_REQUEST_I_FRAME, 1) != MMAL_SUCCESS)
+	   {
+	      vcos_log_error("failed to request I-FRAME");
+	   }
+	   return 0; //current buffer is the frame being dropped
+       }
+       ++pData->pstate->nFrames;
+       if (framesHaveBeenOutputtingTooFastForDesiredFps(pData, current_time))
+       {
+	   pData->pstate->bDroppingFrame = 1;
+	   return 1; //current buffer is the frame before the frame to be dropped
+       }
+    }
+    return (pData->pstate->bDroppingFrame == 0);
+}
+
+/**
  *  buffer header callback function for camera control
  *
  *  Callback will dump buffer data to the specific file
@@ -1128,10 +1194,10 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
                   bytes_written = buffer->length;
                }
             }
-            else
-            {
-               bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);            
-            }
+	    else if (wantBufferGivenDesiredFps(port, buffer, pData, current_time))
+	    {
+		bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
+	    }
 
             mmal_buffer_header_mem_unlock(buffer);
 
